@@ -1,0 +1,55 @@
+cnp_settings:
+  training_epochs: 15
+  context_ratio: 0.3333333
+  context_is_subset: True
+  batch_size_train: 6000
+  files_per_batch_train: 100
+  batch_size_predict: [30000, 100000]
+  files_per_batch_predict: 1
+  number_of_walkers: 1
+  config_wise: False
+  use_data_augmentation: "mixup"   # set to False if mixup files are not prepared
+  use_beta: [0.1, 0.1]
+  signal_to_background_ratio: ""
+  ratio_testing_vs_training: 1/40
+  plot_after: 1000
+
+simulation_settings:
+  theta_headers: ["scint_x", "scint_y"]
+  phi_labels: ["initial_m_x", "initial_m_y", "initial_m_z"]
+  target_headers: ["tag_final"]
+  target_range: [0, 1]
+  signal_condition: ["tag_final==1"]
+  weights_labels: ["weights"]
+  theta_min: [0, 0]
+  theta_max: [95, 102]
+  theta_fixed: [30, 30]
+  lf_cost: 1
+  hf_cost: 2000
+
+path_settings:
+  version: v101.0
+
+  # CNP training input (H5 files)
+  path_to_files_train: ../../data/processed/new_both/training/lf
+
+  # CNP prediction inputs (H5 files)
+  # Example (training LF+HF):
+  path_to_files_predict:
+    - ../../data/processed/new_both/training/lf
+    - ../../data/processed/new_both/training/hf
+
+  # Example for validation-only prediction:
+  # path_to_files_predict:
+  #   - ../../data/processed/new_both/validation/lf
+
+  iteration: [0, 0]
+  fidelity: [0, 1]
+
+  # Optional explicit validation CSV path
+  path_to_files_validation: ../../data/out/cnp/cnp_v101.0_output_validation_15epochs.csv
+
+  # Outputs
+  path_out_cnp: ../../data/out/cnp
+  path_out_mfgp: ../../data/out/mfgp
+  path_out_pce: ../../data/out/pce

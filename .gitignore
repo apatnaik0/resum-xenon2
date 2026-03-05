@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# Keep data directory structure, ignore generated contents
+# (leaf folders contain .gitignore files that remain tracked)
+data/**
+!data/**/
+!data/**/.gitignore
+!data/**/.gitkeep
