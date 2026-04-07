@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
+from matplotlib.lines import Line2D
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -87,14 +88,25 @@ def discover_cnp_output_csv(out_dir_cnp: Path, version: str, prefer_validation: 
     if not out_dir_cnp.exists():
         raise FileNotFoundError(f"CNP output directory does not exist: {out_dir_cnp}")
 
+    # Prefer regular aggregated output for MF-GP fitting; exclude per-signal exports.
+    regular = sorted(
+        [
+            p
+            for p in out_dir_cnp.glob(f"cnp_{version}_output_*epochs.csv")
+            if ("validation" not in p.name and "per_signal" not in p.name)
+        ]
+    )
+    validation = sorted(
+        [
+            p
+            for p in out_dir_cnp.glob(f"cnp_{version}_output_validation_*epochs.csv")
+            if "per_signal" not in p.name
+        ]
+    )
     if prefer_validation:
-        pats = [f"cnp_{version}_output_validation_*epochs.csv", f"cnp_{version}_output_*epochs.csv"]
+        candidates = validation + regular
     else:
-        pats = [f"cnp_{version}_output_*epochs.csv", f"cnp_{version}_output_validation_*epochs.csv"]
-
-    candidates: List[Path] = []
-    for pat in pats:
-        candidates.extend(sorted(out_dir_cnp.glob(pat)))
+        candidates = regular + validation
 
     candidates = [c for c in candidates if c.is_file()]
     if not candidates:
@@ -105,6 +117,16 @@ def discover_cnp_output_csv(out_dir_cnp: Path, version: str, prefer_validation: 
 
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates[0]
+
+
+def _missing_csv_message(csv_path: Path, out_dir_cnp: Path, version: str) -> str:
+    nearby = sorted(out_dir_cnp.glob(f"cnp_{version}_*epochs.csv")) if out_dir_cnp.exists() else []
+    nearby_lines = "\n".join([f"  - {p}" for p in nearby[:20]]) if nearby else "  (none found)"
+    return (
+        f"CSV not found: {csv_path}\n"
+        f"Searched under: {out_dir_cnp}\n"
+        f"Available matching files:\n{nearby_lines}"
+    )
 
 
 def _aggregate_rows(df: pd.DataFrame, x_cols: Sequence[str]) -> pd.DataFrame:
@@ -293,10 +315,16 @@ class MFGPResult:
     model_json: Path
     metrics_json: Path
     prediction_csv: Path
-    data_plot: Path
-    parity_plot: Path
+    grid_csv: Path
+    data_plot: Optional[Path]
+    parity_plot: Optional[Path]
     mean_std_plot: Path
-    residual_plot: Path
+    residual_plot: Optional[Path]
+    theta_group_plot_dir: Optional[Path]
+    across_theta_plot: Optional[Path]
+    across_theta_zoom_plot: Optional[Path]
+    coverage_plot: Optional[Path]
+    validation_parity_plot: Optional[Path]
 
 
 def _grid_from_bounds(theta_min: Sequence[float], theta_max: Sequence[float], n: int = 120) -> np.ndarray:
@@ -327,21 +355,13 @@ def _scatter_grid(df: pd.DataFrame, x_col: str, y_col: str, z_col: str, n: int =
     return X, Y, Z
 
 
-def _plot_data_maps(lf: pd.DataFrame, hf: pd.DataFrame, x_cols: Sequence[str], out_path: Path) -> None:
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
-
-    s1 = ax[0].scatter(lf[x_cols[0]], lf[x_cols[1]], c=lf["y_cnp"], cmap="viridis", s=35, edgecolor="none")
-    ax[0].set_title("LF observations (y_cnp)")
-    ax[0].set_xlabel(x_cols[0])
-    ax[0].set_ylabel(x_cols[1])
-    plt.colorbar(s1, ax=ax[0], label="y_cnp")
-
-    s2 = ax[1].scatter(hf[x_cols[0]], hf[x_cols[1]], c=hf["y_raw"], cmap="viridis", s=35, edgecolor="none")
-    ax[1].set_title("HF observations (y_raw)")
-    ax[1].set_xlabel(x_cols[0])
-    ax[1].set_ylabel(x_cols[1])
-    plt.colorbar(s2, ax=ax[1], label="y_raw")
-
+def _plot_hf_observation_map(hf: pd.DataFrame, x_cols: Sequence[str], out_path: Path) -> None:
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+    s = ax.scatter(hf[x_cols[0]], hf[x_cols[1]], c=hf["y_raw"], cmap="viridis", s=40, edgecolor="none")
+    ax.set_title("HF observations (y_raw)")
+    ax.set_xlabel(x_cols[0])
+    ax.set_ylabel(x_cols[1])
+    plt.colorbar(s, ax=ax, label="y_raw")
     fig.tight_layout()
     fig.savefig(out_path, dpi=170)
     plt.close(fig)
@@ -367,6 +387,7 @@ def _plot_mean_std_heatmaps(
     mean_hf: np.ndarray,
     std_hf: np.ndarray,
     x_cols: Sequence[str],
+    hf_points: Optional[np.ndarray],
     out_path: Path,
 ) -> None:
     gx = np.unique(grid_xy[:, 0])
@@ -378,16 +399,42 @@ def _plot_mean_std_heatmaps(
     fig, ax = plt.subplots(1, 2, figsize=(12, 5))
 
     im1 = ax[0].contourf(gx, gy, Zm, levels=24, cmap="viridis")
+    if hf_points is not None and len(hf_points):
+        ax[0].scatter(
+            hf_points[:, 0],
+            hf_points[:, 1],
+            s=32,
+            c="white",
+            edgecolor="black",
+            linewidth=0.7,
+            alpha=0.95,
+            label="HF points",
+        )
     ax[0].set_title("MF-GP Mean (HF)")
     ax[0].set_xlabel(x_cols[0])
     ax[0].set_ylabel(x_cols[1])
     plt.colorbar(im1, ax=ax[0], label="mean")
+    if hf_points is not None and len(hf_points):
+        ax[0].legend(loc="best", fontsize=8, frameon=True)
 
     im2 = ax[1].contourf(gx, gy, Zs, levels=24, cmap="Reds")
+    if hf_points is not None and len(hf_points):
+        ax[1].scatter(
+            hf_points[:, 0],
+            hf_points[:, 1],
+            s=32,
+            c="white",
+            edgecolor="black",
+            linewidth=0.7,
+            alpha=0.95,
+            label="HF points",
+        )
     ax[1].set_title("MF-GP Std (HF)")
     ax[1].set_xlabel(x_cols[0])
     ax[1].set_ylabel(x_cols[1])
     plt.colorbar(im2, ax=ax[1], label="std")
+    if hf_points is not None and len(hf_points):
+        ax[1].legend(loc="best", fontsize=8, frameon=True)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=170)
@@ -433,9 +480,185 @@ def _plot_residual_heatmap(
     plt.close(fig)
 
 
+def _resolve_optional_validation_csv(runtime: MFGPRuntimeConfig) -> Optional[Path]:
+    try:
+        raw = yaml.safe_load(runtime.config_path.read_text())
+        p = raw.get("path_settings", {}).get("path_to_files_validation")
+        if not p:
+            return None
+        cand = Path(p)
+        if not cand.is_absolute():
+            cand = (runtime.config_path.parent / cand).resolve()
+        return cand if cand.exists() else None
+    except Exception:
+        return None
+
+
+def _plot_theta_group_uncertainty_bands(
+    df_val: pd.DataFrame,
+    theta_headers: Sequence[str],
+    model: "CleanAutoregressiveMFGP",
+    out_dir: Path,
+) -> int:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    thx, thy = theta_headers[0], theta_headers[1]
+    groups = list(df_val.groupby([thx, thy], dropna=False))
+    count = 0
+
+    for (xv, yv), g in groups:
+        y_true = g["y_raw"].to_numpy(dtype=float)
+        if len(y_true) == 0:
+            continue
+
+        x_pred = np.array([[float(xv), float(yv)]], dtype=float)
+        mu, std, _, _ = model.predict(x_pred)
+        mu = float(mu[0])
+        std = float(std[0])
+        if not np.isfinite(mu):
+            mu = 0.0
+        if not np.isfinite(std) or std < 0:
+            std = 0.0
+        idx = np.arange(len(y_true), dtype=int)
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.plot(idx, y_true, "o", ms=3.5, alpha=0.7, label="validation y_raw")
+        ax.axhline(mu, color="tab:red", lw=1.5, label="MF-GP mean")
+        # Use true model std for both statistics and rendered bands.
+        std_true = max(std, 1e-12)
+        err = np.abs(y_true - mu)
+        n = int(len(y_true))
+        c1 = int(np.sum(err <= 1.0 * std_true))
+        c2 = int(np.sum(err <= 2.0 * std_true))
+        c3 = int(np.sum(err <= 3.0 * std_true))
+        y_raw_mean = float(np.mean(y_true))
+        y_raw_std = float(np.std(y_true))
+
+        # Render bands using axhspan to guarantee drawing even for tiny/degenerate x ranges.
+        ax.axhspan(mu - 3 * std_true, mu + 3 * std_true, color="tab:purple", alpha=0.10, label="3σ band")
+        ax.axhspan(mu - 2 * std_true, mu + 2 * std_true, color="tab:orange", alpha=0.18, label="2σ band")
+        ax.axhspan(mu - 1 * std_true, mu + 1 * std_true, color="tab:red", alpha=0.30, label="1σ band")
+        # Draw boundary lines explicitly so band edges are always visible.
+        for k, color in [(1, "tab:red"), (2, "tab:orange"), (3, "tab:purple")]:
+            ax.axhline(mu + k * std_true, color=color, lw=0.8, alpha=0.9)
+            ax.axhline(mu - k * std_true, color=color, lw=0.8, alpha=0.9)
+        ax.set_title(f"Theta ({thx}={xv}, {thy}={yv})")
+        ax.set_xlabel("Sample index")
+        ax.set_ylabel("y_raw")
+        # Mild zoom-in around the main mass while keeping uncertainty region in view.
+        if n >= 5:
+            q_lo, q_hi = np.quantile(y_true, [0.02, 0.98])
+            y_lo = float(min(q_lo, mu - 3 * std_true))
+            y_hi = float(max(q_hi, mu + 3 * std_true))
+        else:
+            y_lo = float(min(np.min(y_true), mu - 3 * std_true))
+            y_hi = float(max(np.max(y_true), mu + 3 * std_true))
+        y_span = max(y_hi - y_lo, 1e-9)
+        ax.set_ylim(y_lo - 0.10 * y_span, y_hi + 0.10 * y_span)
+        ax.grid(True, alpha=0.3)
+        # Add numeric diagnostics directly in the legend.
+        extra = [
+            Line2D([0], [0], color="none", label=f"n points: {n}"),
+            Line2D([0], [0], color="none", label=f"y_raw mean: {y_raw_mean:.6g}"),
+            Line2D([0], [0], color="none", label=f"y_raw std: {y_raw_std:.6g}"),
+            Line2D([0], [0], color="none", label=f"model mean: {mu:.6g}"),
+            Line2D([0], [0], color="none", label=f"model std: {std_true:.6g}"),
+            Line2D([0], [0], color="none", label=f"within 1σ: {c1}/{n}"),
+            Line2D([0], [0], color="none", label=f"within 2σ: {c2}/{n}"),
+            Line2D([0], [0], color="none", label=f"within 3σ: {c3}/{n}"),
+        ]
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles + extra, labels + [h.get_label() for h in extra], loc="best", fontsize=8, frameon=True)
+        fig.tight_layout()
+        f = out_dir / f"uncertainty_bands_theta_{int(round(float(xv)))}_{int(round(float(yv)))}.png"
+        fig.savefig(f, dpi=170)
+        plt.close(fig)
+        count += 1
+    return count
+
+
+def _plot_across_thetas(
+    df_val: pd.DataFrame,
+    theta_headers: Sequence[str],
+    model: "CleanAutoregressiveMFGP",
+    out_path: Path,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    thx, thy = theta_headers[0], theta_headers[1]
+    agg = (
+        df_val.groupby([thx, thy], as_index=False)
+        .agg(y_raw_mean=("y_raw", "mean"))
+        .sort_values([thx, thy], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    x_pred = agg[[thx, thy]].to_numpy(dtype=float)
+    mu, std, _, _ = model.predict(x_pred)
+
+    idx = np.arange(len(agg), dtype=int)
+    y_true = agg["y_raw_mean"].to_numpy(dtype=float)
+    y_pred = mu.astype(float)
+    y_std = std.astype(float)
+    y_std_true = np.maximum(y_std, 1e-12)
+    err = np.abs(y_true - y_pred)
+    n = int(len(y_true))
+    c1 = int(np.sum(err <= 1.0 * y_std_true))
+    c2 = int(np.sum(err <= 2.0 * y_std_true))
+    c3 = int(np.sum(err <= 3.0 * y_std_true))
+
+    fig, ax = plt.subplots(1, 1, figsize=(max(10, 0.18 * len(idx)), 5))
+    ax.plot(idx, y_true, "o", ms=4, color="black", alpha=0.75, label="Validation y_raw mean")
+    ax.plot(idx, y_pred, "-", lw=1.5, color="tab:blue", label="MF-GP mean")
+    ax.fill_between(idx, y_pred - y_std_true, y_pred + y_std_true, color="tab:blue", alpha=0.24, label="1σ band")
+    ax.fill_between(idx, y_pred - 2 * y_std_true, y_pred + 2 * y_std_true, color="tab:orange", alpha=0.16, label="2σ band")
+    ax.fill_between(idx, y_pred - 3 * y_std_true, y_pred + 3 * y_std_true, color="tab:purple", alpha=0.10, label="3σ band")
+    ax.set_xlabel("Theta index (sorted by scint_x, scint_y)")
+    ax.set_ylabel("y")
+    ax.set_title("Validation Thetas: Mean y_raw vs MF-GP Prediction")
+    ax.grid(True, alpha=0.3)
+    extra = [
+        Line2D([0], [0], color="none", label=f"n points: {n}"),
+        Line2D([0], [0], color="none", label=f"within 1σ: {c1}/{n}"),
+        Line2D([0], [0], color="none", label=f"within 2σ: {c2}/{n}"),
+        Line2D([0], [0], color="none", label=f"within 3σ: {c3}/{n}"),
+    ]
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles + extra, labels + [h.get_label() for h in extra], loc="best", fontsize=8, frameon=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+    return y_true, y_pred, y_std
+
+
+def _plot_coverage_summary(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray, out_path: Path) -> None:
+    if len(y_true) == 0:
+        return
+    err = np.abs(y_true - y_pred)
+    s = np.maximum(y_std, 1e-12)
+    cov1 = float(np.mean(err <= 1.0 * s))
+    cov2 = float(np.mean(err <= 2.0 * s))
+    cov3 = float(np.mean(err <= 3.0 * s))
+    mae = float(np.mean(err))
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    labels = ["1σ coverage", "2σ coverage", "3σ coverage"]
+    vals = [cov1, cov2, cov3]
+    ax.bar(labels, vals, color=["tab:blue", "tab:green", "tab:purple"], alpha=0.85)
+    ax.axhline(0.68, ls="--", lw=1, color="tab:blue", alpha=0.8, label="Ideal 1σ ~ 0.68")
+    ax.axhline(0.95, ls="--", lw=1, color="tab:green", alpha=0.8, label="Ideal 2σ ~ 0.95")
+    ax.axhline(0.997, ls="--", lw=1, color="tab:purple", alpha=0.8, label="Ideal 3σ ~ 0.997")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("Fraction")
+    ax.set_title(f"Coverage Summary (MAE={mae:.4g})")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(loc="lower right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+
+
 def run_clean_mfgp(
     config_path: str | Path,
     cnp_csv: Optional[str | Path] = None,
+    validation_csv: Optional[str | Path] = None,
     iteration: int = 0,
     lf_fidelity: int = 0,
     hf_fidelity: int = 1,
@@ -451,13 +674,13 @@ def run_clean_mfgp(
     runtime = load_runtime_config(config_path)
     runtime.out_dir_mfgp.mkdir(parents=True, exist_ok=True)
 
-    cnp_csv_path = Path(cnp_csv).resolve() if cnp_csv else discover_cnp_output_csv(
+    cnp_csv_path = Path(cnp_csv).expanduser().resolve() if cnp_csv else discover_cnp_output_csv(
         runtime.out_dir_cnp,
         runtime.version,
         prefer_validation=prefer_validation_csv,
     )
     if not cnp_csv_path.exists():
-        raise FileNotFoundError(f"CNP CSV not found: {cnp_csv_path}")
+        raise FileNotFoundError(_missing_csv_message(cnp_csv_path, runtime.out_dir_cnp, runtime.version))
     if verbose:
         print(f"[stage] Using CNP CSV: {cnp_csv_path}")
 
@@ -478,13 +701,21 @@ def run_clean_mfgp(
     if verbose:
         print(f"[data] n_lf={len(lf)} n_hf={len(hf)} x_dim={x_lf.shape[1]}")
 
-    # Noise levels from data statistics; keep small floor for numeric stability.
-    alpha_lf = float(np.nanmean(lf["y_cnp_err"].to_numpy(dtype=float)) ** 2)
-    alpha_hf = float(np.nanstd(y_hf) ** 2 * 1e-4)
+    # Noise levels reverted to old-notebook style.
+    # LF noise = mean(y_cnp_err)
+    # HF noise = std(y_raw) * 1e-8
+    lf_cnp_noise = float(np.nanmean(lf["y_cnp_err"].to_numpy(dtype=float)))
+    hf_sim_noise = float(np.nanstd(y_hf))
+    alpha_lf = lf_cnp_noise
+    alpha_hf = hf_sim_noise * 1e-8
+
     alpha_lf = max(alpha_lf, 1e-10)
     alpha_hf = max(alpha_hf, 1e-10)
     if verbose:
-        print(f"[data] alpha_lf={alpha_lf:.3e} alpha_hf={alpha_hf:.3e}")
+        print(
+            f"[data] lf_cnp_noise={lf_cnp_noise:.3e} hf_sim_noise={hf_sim_noise:.3e} "
+            f"alpha_lf={alpha_lf:.3e} alpha_hf={alpha_hf:.3e}"
+        )
 
     model = CleanAutoregressiveMFGP(random_state=random_state, alpha_lf=alpha_lf, alpha_hf=alpha_hf)
     model.fit(x_lf=x_lf, y_lf=y_lf, x_hf=x_hf, y_hf=y_hf, verbose=verbose)
@@ -589,15 +820,77 @@ def run_clean_mfgp(
         )
     )
 
-    data_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_data_maps_iter{iteration}.png"
-    parity_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_parity_iter{iteration}.png"
+    data_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_hf_observations_iter{iteration}.png"
+    parity_plot = None
     mean_std_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_mean_std_iter{iteration}.png"
-    residual_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_residual_iter{iteration}.png"
+    residual_plot = None
 
-    _plot_data_maps(lf, hf, runtime.theta_headers, data_plot)
-    _plot_parity(y_hf, hf_pred_mean, hf_pred_std, parity_plot)
-    _plot_mean_std_heatmaps(grid_xy, grid_mean, grid_std, runtime.theta_headers, mean_std_plot)
-    _plot_residual_heatmap(df_hf, runtime.theta_headers, residual_plot)
+    _plot_hf_observation_map(hf, runtime.theta_headers, data_plot)
+    # Training-side parity plot intentionally omitted to reduce redundant outputs.
+    _plot_mean_std_heatmaps(
+        grid_xy,
+        grid_mean,
+        grid_std,
+        runtime.theta_headers,
+        hf_points=x_hf,
+        out_path=mean_std_plot,
+    )
+
+    theta_group_plot_dir: Optional[Path] = None
+    across_theta_plot: Optional[Path] = None
+    across_theta_zoom_plot: Optional[Path] = None
+    coverage_plot: Optional[Path] = None
+    validation_parity_plot: Optional[Path] = None
+
+    # Additional old-notebook-style validation plots.
+    val_csv = Path(validation_csv).expanduser().resolve() if validation_csv is not None else _resolve_optional_validation_csv(runtime)
+    if val_csv is not None:
+        if not val_csv.exists():
+            if verbose:
+                print(_missing_csv_message(val_csv, runtime.out_dir_cnp, runtime.version))
+                print("[warn] Explicit validation_csv does not exist; skipping extra validation plots.")
+            val_csv = None
+    if val_csv is not None:
+        try:
+            if verbose:
+                print(f"[stage] Loading validation CSV for extra plots: {val_csv}")
+            df_val = pd.read_csv(val_csv)
+            need = set([*runtime.theta_headers, "iteration", "y_raw"])
+            if need.issubset(df_val.columns):
+                df_val = df_val[df_val["iteration"].astype(int) == int(iteration)].copy()
+                if len(df_val):
+                    theta_group_plot_dir = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_theta_group_plots_iter{iteration}"
+                    n_groups = _plot_theta_group_uncertainty_bands(
+                        df_val=df_val,
+                        theta_headers=runtime.theta_headers,
+                        model=model,
+                        out_dir=theta_group_plot_dir,
+                    )
+                    if verbose:
+                        print(f"[done] Generated theta-group uncertainty plots: {n_groups}")
+
+                    across_theta_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_across_thetas_iter{iteration}.png"
+                    across_theta_zoom_plot = None
+                    y_true_v, y_pred_v, y_std_v = _plot_across_thetas(
+                        df_val=df_val,
+                        theta_headers=runtime.theta_headers,
+                        model=model,
+                        out_path=across_theta_plot,
+                    )
+
+                    coverage_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_coverage_summary_iter{iteration}.png"
+                    _plot_coverage_summary(y_true_v, y_pred_v, y_std_v, coverage_plot)
+
+                    # Validation parity (per-theta means).
+                    validation_parity_plot = runtime.out_dir_mfgp / f"mfgp_{runtime.version}_validation_parity_iter{iteration}.png"
+                    _plot_parity(y_true_v, y_pred_v, y_std_v, validation_parity_plot)
+            elif verbose:
+                print("[warn] Validation CSV missing required columns for extra plots; skipping.")
+        except Exception as exc:
+            if verbose:
+                print(f"[warn] Could not generate validation extra plots: {exc}")
+    elif verbose:
+        print("[info] path_to_files_validation not found; skipping extra validation plots.")
 
     elapsed = time.time() - t0
     if verbose:
@@ -611,10 +904,16 @@ def run_clean_mfgp(
         model_json=model_json,
         metrics_json=metrics_json,
         prediction_csv=pred_csv,
+        grid_csv=grid_csv,
         data_plot=data_plot,
         parity_plot=parity_plot,
         mean_std_plot=mean_std_plot,
         residual_plot=residual_plot,
+        theta_group_plot_dir=theta_group_plot_dir,
+        across_theta_plot=across_theta_plot,
+        across_theta_zoom_plot=across_theta_zoom_plot,
+        coverage_plot=coverage_plot,
+        validation_parity_plot=validation_parity_plot,
     )
 
 
@@ -622,6 +921,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Clean multi-fidelity GP pipeline (no resum helpers)")
     p.add_argument("--config", type=str, default=str(_default_config_path()), help="Path to settings2.yaml")
     p.add_argument("--cnp-csv", type=str, default=None, help="Optional explicit CNP output CSV")
+    p.add_argument("--validation-csv", type=str, default=None, help="Optional explicit validation CSV for extra plots")
     p.add_argument("--iteration", type=int, default=0, help="Iteration value to filter")
     p.add_argument("--lf-fidelity", type=int, default=0, help="LF fidelity id")
     p.add_argument("--hf-fidelity", type=int, default=1, help="HF fidelity id")
@@ -642,6 +942,7 @@ def main() -> None:
     run_clean_mfgp(
         config_path=args.config,
         cnp_csv=args.cnp_csv,
+        validation_csv=args.validation_csv,
         iteration=args.iteration,
         lf_fidelity=args.lf_fidelity,
         hf_fidelity=args.hf_fidelity,
